@@ -1,0 +1,53 @@
+[package]
+name = "claude-mux"
+version = "0.1.0"
+edition = "2021"
+description = "Transparent multi-account proxy for Claude Code Max subscriptions"
+license = "MIT"
+repository = "https://github.com/anthropics/claude-mux"
+keywords = ["claude", "proxy", "rate-limit", "load-balancer"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP proxy core
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1"
+
+# TLS
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", features = ["x509-parser"] }
+
+# HTTP client for upstream + token refresh
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Misc
+anyhow = "1"
+base64 = "0.22"
+chrono = "0.4"
+dirs = "6"
+tokio-stream = "0.1"
+pin-project-lite = "0.2"
+time = { version = "0.3.47", features = ["formatting"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
