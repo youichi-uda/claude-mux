@@ -287,7 +287,7 @@ async fn cmd_start(port: u16) -> Result<()> {
                     total_429s,
                     statuses
                         .iter()
-                        .map(|s| format!("{}({})", s.name, if s.available { "ok" } else { "cd" }))
+                        .map(|s| format!("{}({})", s.name, if !s.available { "cd" } else if s.token_expired { "exp" } else { "ok" }))
                         .collect::<Vec<_>>()
                         .join(", ")
                 );

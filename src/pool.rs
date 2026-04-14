@@ -142,7 +142,7 @@ impl AccountPool {
                 continue;
             }
             let acct = &accounts[idx];
-            if acct.is_available() {
+            if acct.is_available() && !acct.is_token_expired() {
                 let token = acct.access_token.clone();
                 drop(accounts);
                 *self.current_index.write().await = (idx + 1) % n;
@@ -175,7 +175,7 @@ impl AccountPool {
     }
 
     /// Refresh the OAuth access token for an account.
-    async fn refresh_token(&self, index: usize) -> Result<()> {
+    pub async fn refresh_token(&self, index: usize) -> Result<()> {
         let refresh_token = {
             let accounts = self.accounts.read().await;
             accounts[index].refresh_token.clone()

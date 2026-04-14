@@ -350,13 +350,24 @@ impl ProxyServer {
                 continue;
             }
 
-            // Treat 401 as "account dead" — put on long cooldown and try next.
-            // This happens when an OAuth token is invalidated server-side
-            // (e.g., after claude auth logout, or session rotation).
+            // 401: try refreshing the token first before giving up.
+            // This handles server-side session rotation without unnecessarily
+            // putting the account on a long cooldown.
             if status == StatusCode::UNAUTHORIZED {
-                self.pool.mark_rate_limited(acct_idx, 3600).await; // 1 hour cooldown
                 warn!(
-                    "[{}] 401 on {} — token invalidated, cooldown 1h, trying next account",
+                    "[{}] 401 on {} — attempting token refresh",
+                    acct_name, path
+                );
+                if self.pool.refresh_token(acct_idx).await.is_ok() {
+                    info!("[{}] Token refreshed after 401, will retry on next attempt", acct_name);
+                    // Don't mark as rate limited — the refreshed token may work.
+                    // Let the retry loop pick this account again.
+                    continue;
+                }
+                // Refresh failed — account is truly dead, long cooldown.
+                self.pool.mark_rate_limited(acct_idx, 3600).await;
+                warn!(
+                    "[{}] 401 on {} — token refresh failed, cooldown 1h, trying next account",
                     acct_name, path
                 );
                 continue;
