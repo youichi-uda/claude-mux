@@ -232,10 +232,18 @@ impl ProxyServer {
         let path = uri.path().to_string();
         let host = hostname.unwrap_or(TARGET_HOST);
 
-        // Collect headers (excluding x-api-key — we'll set our own)
+        // Only rotate tokens on inference endpoints.
+        // Other endpoints (auth, sessions, telemetry) keep their original headers.
+        let should_rotate = path.starts_with("/v1/messages");
+
+        // Collect headers. If rotating, strip x-api-key + authorization.
+        // Otherwise, pass everything through unchanged.
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in req.headers() {
-            if name == "x-api-key" || name == "host" || name == "authorization" {
+            if name == "host" {
+                continue;
+            }
+            if should_rotate && (name == "x-api-key" || name == "authorization") {
                 continue;
             }
             if let (Ok(n), Ok(v)) = (
@@ -248,6 +256,35 @@ impl ProxyServer {
 
         // Collect request body
         let body_bytes = req.collect().await?.to_bytes();
+
+        // If not an inference endpoint, do a single passthrough request without token rotation.
+        if !should_rotate {
+            let url = format!("https://{}{}", host, path);
+            let mut req_builder = self.http_client.request(method.clone(), &url);
+            req_builder = req_builder.headers(headers.clone());
+            req_builder = req_builder.header("Host", host);
+            if !body_bytes.is_empty() {
+                req_builder = req_builder.body(body_bytes.clone());
+            }
+
+            let resp = req_builder.send().await?;
+            let status = resp.status();
+            debug!("[passthrough] {} {} {}", status.as_u16(), method, path);
+
+            let mut builder = Response::builder().status(status);
+            for (name, value) in resp.headers() {
+                builder = builder.header(name.as_str(), value.as_bytes());
+            }
+            let stream = resp.bytes_stream();
+            let body = StreamBody::new(
+                tokio_stream::StreamExt::map(stream, |chunk| {
+                    chunk
+                        .map(Frame::data)
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+                }),
+            );
+            return Ok(builder.body(body.boxed()).unwrap());
+        }
 
         // Try with selected account, retry on 429
         let mut tried_indices: Vec<usize> = Vec::new();
