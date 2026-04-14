@@ -66,18 +66,21 @@ Log in to each Claude Max account and add it:
 
 ```bash
 # Log in to account 1 (already logged in? skip this)
-claude login
+claude auth login
 
 # Add current credentials
 claude-mux add personal
 
 # Log in to account 2
-claude login  # Use different email/account
+claude auth logout
+claude auth login  # Use different email/account
 
 # Add those credentials
 claude-mux add work1
 
 # Repeat for account 3...
+claude auth logout
+claude auth login
 claude-mux add work2
 ```
 
