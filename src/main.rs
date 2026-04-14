@@ -266,7 +266,9 @@ async fn cmd_start(port: u16) -> Result<()> {
     }
     println!();
     println!("Launch Claude Code with:");
-    println!("  HTTPS_PROXY=http://127.0.0.1:{} claude", port);
+    println!("  HTTPS_PROXY=http://127.0.0.1:{} \\", port);
+    println!("  NODE_EXTRA_CA_CERTS={} \\", Config::ca_cert_path().display());
+    println!("  claude");
     println!();
 
     // Spawn status printer
@@ -353,5 +355,6 @@ fn cmd_ca_path() -> Result<()> {
 fn cmd_env() -> Result<()> {
     let config = Config::load()?;
     println!("export HTTPS_PROXY=http://127.0.0.1:{}", config.listen.port);
+    println!("export NODE_EXTRA_CA_CERTS={}", Config::ca_cert_path().display());
     Ok(())
 }

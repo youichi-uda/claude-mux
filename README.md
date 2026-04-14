@@ -91,14 +91,18 @@ claude-mux add work2
 claude-mux start
 
 # Terminal 2: launch Claude Code through the proxy
-HTTPS_PROXY=http://127.0.0.1:8119 claude
+HTTPS_PROXY=http://127.0.0.1:8119 \
+NODE_EXTRA_CA_CERTS=~/.claude-mux/ca-cert.pem \
+claude
 ```
 
 Or add to your shell profile:
 
 ```bash
 # ~/.zshrc
-alias claude-proxied='HTTPS_PROXY=http://127.0.0.1:8119 claude'
+alias claude-proxied='HTTPS_PROXY=http://127.0.0.1:8119 \
+NODE_EXTRA_CA_CERTS=~/.claude-mux/ca-cert.pem \
+claude'
 ```
 
 ## Commands
