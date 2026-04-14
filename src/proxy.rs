@@ -234,7 +234,7 @@ impl ProxyServer {
 
         // Only rotate tokens on inference endpoints.
         // Other endpoints (auth, sessions, telemetry) keep their original headers.
-        let should_rotate = path.starts_with("/v1/messages");
+        let should_rotate = path == "/v1/messages" || path == "/v1/messages/";
 
         // Collect headers. If rotating, strip x-api-key + authorization.
         // Otherwise, pass everything through unchanged.
@@ -316,6 +316,7 @@ impl ProxyServer {
             let mut req_builder = self.http_client.request(method.clone(), &url);
             req_builder = req_builder.headers(headers.clone());
             req_builder = req_builder.header("x-api-key", &access_token);
+            req_builder = req_builder.header("authorization", format!("Bearer {}", access_token));
             req_builder = req_builder.header("Host", host);
 
             if !body_bytes.is_empty() {
