@@ -350,6 +350,18 @@ impl ProxyServer {
                 continue;
             }
 
+            // Treat 401 as "account dead" — put on long cooldown and try next.
+            // This happens when an OAuth token is invalidated server-side
+            // (e.g., after claude auth logout, or session rotation).
+            if status == StatusCode::UNAUTHORIZED {
+                self.pool.mark_rate_limited(acct_idx, 3600).await; // 1 hour cooldown
+                warn!(
+                    "[{}] 401 on {} — token invalidated, cooldown 1h, trying next account",
+                    acct_name, path
+                );
+                continue;
+            }
+
             // Success — convert reqwest::Response to hyper::Response
             info!("[{}] {} {} {}", acct_name, status.as_u16(), method, path);
 
