@@ -1,5 +1,6 @@
 mod cert;
 mod config;
+mod oauth;
 mod pool;
 mod proxy;
 
@@ -34,6 +35,12 @@ enum Commands {
         name: String,
     },
 
+    /// Log in to a Claude Max account via OAuth (no `claude` CLI needed)
+    Login {
+        /// Account name (e.g., "personal", "work1", "work2")
+        name: String,
+    },
+
     /// Import credentials directly with tokens
     Import {
         /// Account name
@@ -56,8 +63,14 @@ enum Commands {
         port: u16,
     },
 
-    /// Show account status
+    /// Show account status (with live API connectivity check)
     Status,
+
+    /// Refresh OAuth access tokens to verify renewal works
+    Renew {
+        /// Account name (omit to refresh all accounts)
+        name: Option<String>,
+    },
 
     /// Print the CA certificate path (for manual trust)
     CaPath,
@@ -87,6 +100,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Setup => cmd_setup().await,
         Commands::Add { name } => cmd_add(&name).await,
+        Commands::Login { name } => cmd_login(&name).await,
         Commands::Import {
             name,
             access_token,
@@ -95,6 +109,7 @@ async fn main() -> Result<()> {
         } => cmd_import(&name, &access_token, &refresh_token, expires_at).await,
         Commands::Start { port } => cmd_start(port).await,
         Commands::Status => cmd_status().await,
+        Commands::Renew { name } => cmd_renew(name.as_deref()).await,
         Commands::CaPath => cmd_ca_path(),
         Commands::Env => cmd_env(),
     }
@@ -216,6 +231,65 @@ async fn cmd_add(name: &str) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_login(name: &str) -> Result<()> {
+    use std::io::Write;
+
+    let pkce = oauth::PkcePair::generate();
+    let url = oauth::build_authorize_url(&pkce);
+
+    println!("To log in to a new Claude account, open this URL in your browser:\n");
+    println!("  {}\n", url);
+    println!(
+        "TIP: To log in to a *different* Claude account without logging out\n\
+         of your current browser session, open the URL in a Private/Incognito\n\
+         window or a separate browser profile.\n"
+    );
+
+    // Best-effort: open the URL automatically (macOS).
+    let _ = std::process::Command::new("open").arg(&url).status();
+
+    print!("Paste the authorization code shown after login: ");
+    std::io::stdout().flush()?;
+
+    let mut code_input = String::new();
+    std::io::stdin().read_line(&mut code_input)?;
+    let code_input = code_input.trim();
+
+    if code_input.is_empty() {
+        anyhow::bail!("No authorization code entered.");
+    }
+
+    let tokens = oauth::exchange_code(code_input, &pkce)
+        .await
+        .context("Failed to exchange authorization code")?;
+
+    let account = AccountConfig {
+        name: name.to_string(),
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_at: tokens.expires_at,
+        scopes: tokens.scopes,
+    };
+
+    let mut config = Config::load()?;
+    config.add_account(account);
+    config.save()?;
+
+    println!("\nAccount '{}' added successfully!", name);
+    println!("Total accounts: {}", config.accounts.len());
+
+    if config.accounts.len() >= 2 {
+        println!("\nReady to start! Run: claude-mux start");
+    } else {
+        println!(
+            "\nLog in to another account (in a Private window) with: \
+             claude-mux login <name>"
+        );
+    }
+
+    Ok(())
+}
+
 async fn cmd_import(
     name: &str,
     access_token: &str,
@@ -313,29 +387,68 @@ async fn cmd_status() -> Result<()> {
         return Ok(());
     }
 
+    println!("Checking {} account(s)...\n", config.accounts.len());
+
+    // Run connectivity checks in parallel
+    let mut set = tokio::task::JoinSet::new();
+    for acct in &config.accounts {
+        let name = acct.name.clone();
+        let token = acct.access_token.clone();
+        set.spawn(async move {
+            let started = std::time::Instant::now();
+            let result = oauth::check_token(&token).await;
+            (name, result, started.elapsed())
+        });
+    }
+
+    let mut results: std::collections::HashMap<String, (Result<()>, std::time::Duration)> =
+        std::collections::HashMap::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((name, res, dur)) = joined {
+            results.insert(name, (res, dur));
+        }
+    }
+
     println!("Configured accounts:");
-    println!("{:-<60}", "");
+    println!("{:-<78}", "");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
     for acct in &config.accounts {
         let token_preview = if acct.access_token.len() > 20 {
-            format!("{}...{}", &acct.access_token[..10], &acct.access_token[acct.access_token.len()-6..])
+            format!(
+                "{}...{}",
+                &acct.access_token[..10],
+                &acct.access_token[acct.access_token.len() - 6..]
+            )
         } else {
             acct.access_token.clone()
         };
-        let expired = if acct.expires_at > 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            if now >= acct.expires_at {
-                " (EXPIRED)"
-            } else {
-                ""
-            }
+
+        let expired_str = if acct.expires_at == 0 {
+            " (no expiry)".to_string()
+        } else if now >= acct.expires_at {
+            " (EXPIRED)".to_string()
         } else {
-            " (no expiry)"
+            let remaining = (acct.expires_at - now) / 1000 / 60; // minutes
+            if remaining < 60 {
+                format!(" (expires in {}m)", remaining)
+            } else {
+                format!(" (expires in {}h)", remaining / 60)
+            }
         };
 
-        println!("  {} — token: {}{}", acct.name, token_preview, expired);
+        let check_str = match results.get(&acct.name) {
+            Some((Ok(()), dur)) => format!("  ✓ OK ({}ms)", dur.as_millis()),
+            Some((Err(e), _)) => format!("  ✗ FAIL: {}", e),
+            None => "  ? (not checked)".to_string(),
+        };
+
+        println!("  {} — {}{}", acct.name, token_preview, expired_str);
+        println!("    {}", check_str);
     }
 
     println!("\nProxy: http://127.0.0.1:{}", config.listen.port);
@@ -344,6 +457,67 @@ async fn cmd_status() -> Result<()> {
         config.listen.port
     );
 
+    Ok(())
+}
+
+async fn cmd_renew(name: Option<&str>) -> Result<()> {
+    let config = Config::load()?;
+    if config.accounts.is_empty() {
+        anyhow::bail!("No accounts configured.");
+    }
+
+    let pool = pool::AccountPool::new(&config.accounts);
+
+    let targets: Vec<(usize, String)> = if let Some(filter) = name {
+        let accounts = pool.accounts.read().await;
+        match accounts.iter().position(|a| a.name == filter) {
+            Some(idx) => vec![(idx, filter.to_string())],
+            None => anyhow::bail!("Account '{}' not found", filter),
+        }
+    } else {
+        let accounts = pool.accounts.read().await;
+        accounts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i, a.name.clone()))
+            .collect()
+    };
+
+    println!("Refreshing {} account(s)...\n", targets.len());
+
+    let mut all_ok = true;
+    for (idx, acct_name) in targets {
+        print!("  {} — refreshing... ", acct_name);
+        use std::io::Write;
+        std::io::stdout().flush()?;
+
+        match pool.refresh_token(idx).await {
+            Ok(()) => {
+                print!("refreshed, verifying... ");
+                std::io::stdout().flush()?;
+
+                let token = {
+                    let accounts = pool.accounts.read().await;
+                    accounts[idx].access_token.clone()
+                };
+                match oauth::check_token(&token).await {
+                    Ok(()) => println!("✓ OK"),
+                    Err(e) => {
+                        println!("✗ refresh succeeded but API check failed: {}", e);
+                        all_ok = false;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("✗ FAILED: {}", e);
+                all_ok = false;
+            }
+        }
+    }
+
+    if !all_ok {
+        anyhow::bail!("one or more accounts failed renewal");
+    }
     Ok(())
 }
 

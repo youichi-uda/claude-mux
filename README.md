@@ -62,27 +62,38 @@ claude-mux setup
 
 ### 3. Add accounts
 
-Log in to each Claude Max account and add it:
+Use the built-in OAuth login. This avoids `claude auth logout`, which would
+otherwise revoke the token of the previously-added account when you log out
+of your browser session to switch accounts:
 
 ```bash
-# Log in to account 1 (already logged in? skip this)
-claude auth login
+# Account 1 — opens claude.ai in your default browser
+claude-mux login personal
 
-# Add current credentials
-claude-mux add personal
+# Account 2 — open the printed URL in a Private/Incognito window
+# (or a different browser profile) so you don't have to log out
+# of your existing claude.ai session.
+claude-mux login work1
 
-# Log in to account 2
-claude auth logout
-claude auth login  # Use different email/account
-
-# Add those credentials
-claude-mux add work1
-
-# Repeat for account 3...
-claude auth logout
-claude auth login
-claude-mux add work2
+# Account 3...
+claude-mux login work2
 ```
+
+Each `login` command:
+
+1. Generates a PKCE pair and prints an authorize URL
+2. Opens it in your default browser (also printed for manual copy)
+3. After you log in, claude.ai shows an authorization code — paste it back
+4. Tokens are saved to `~/.claude-mux/config.json`
+
+> **Why a Private window?** Switching accounts on claude.ai requires logging
+> out of the current account, and that revokes the previously-issued tokens.
+> Opening each `login` URL in a fresh Private window keeps every account's
+> session independent.
+
+Alternatively, if you have already logged in via `claude auth login`, you
+can import those credentials with `claude-mux add <name>` (reads from the
+macOS Keychain).
 
 ### 4. Start proxy & use Claude Code
 
@@ -110,7 +121,8 @@ claude'
 | Command | Description |
 |---|---|
 | `claude-mux setup` | Generate CA cert and install to system keychain |
-| `claude-mux add <name>` | Add current Claude Code credentials as a named account |
+| `claude-mux login <name>` | OAuth-login a new account in your browser (Private window for 2nd+ account) |
+| `claude-mux add <name>` | Add current Claude Code credentials (from `claude auth login`) as a named account |
 | `claude-mux import <name> --access-token ... --refresh-token ...` | Import credentials directly |
 | `claude-mux start [-p PORT]` | Start the proxy (default port: 8119) |
 | `claude-mux status` | Show configured accounts and their status |

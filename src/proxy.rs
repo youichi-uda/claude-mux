@@ -286,49 +286,131 @@ impl ProxyServer {
             return Ok(builder.body(body.boxed()).unwrap());
         }
 
-        // Try with selected account, retry on 429
-        let mut tried_indices: Vec<usize> = Vec::new();
-        let max_retries = 3;
+        // Aggressive retry: keep going within a total time + attempt budget.
+        // Server-side overload (global throttle) gets short cooldowns + many retries;
+        // per-account quota gets the server's Retry-After and we rotate elsewhere.
+        let started = std::time::Instant::now();
+        let total_budget = std::time::Duration::from_secs(600); // 10 minutes
+        // Max attempts is a sanity cap; the time budget is the real limit.
+        // Each iteration is fast (no sleep) until accounts are all cooling
+        // down, at which point the cooldown-wait branch slows the cadence.
+        let max_attempts: u32 = 500;
 
-        for attempt in 0..max_retries {
-            // Pick an account
-            let (acct_idx, access_token) = if attempt == 0 {
-                match self.pool.pick().await {
-                    Some(v) => v,
-                    None => {
-                        return Ok(Response::builder()
-                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                            .body(Full::new(Bytes::from("No accounts available")).map_err(|e| match e {}).boxed())
-                            .unwrap());
-                    }
-                }
-            } else {
-                let exclude = tried_indices.last().copied().unwrap_or(usize::MAX);
-                match self.pool.pick_excluding(exclude).await {
-                    Some(v) => v,
-                    None => break, // No more accounts to try
+        let mut last_acct_idx: Option<usize> = None;
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt += 1;
+            let elapsed = started.elapsed();
+            if attempt > max_attempts || elapsed >= total_budget {
+                warn!(
+                    "Retry budget exhausted for {} (attempt {}, elapsed {}s)",
+                    path,
+                    attempt - 1,
+                    elapsed.as_secs(),
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(
+                        Full::new(Bytes::from("All accounts rate limited"))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )
+                    .unwrap());
+            }
+
+            // Pick — prefer rotating away from the previous attempt to spread load.
+            let pick = match last_acct_idx {
+                Some(prev) => match self.pool.pick_excluding(prev).await {
+                    Some(v) => Some(v),
+                    None => self.pool.pick().await,
+                },
+                None => self.pool.pick().await,
+            };
+            let (acct_idx, access_token) = match pick {
+                Some(v) => v,
+                None => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(
+                            Full::new(Bytes::from("No accounts configured"))
+                                .map_err(|e| match e {})
+                                .boxed(),
+                        )
+                        .unwrap());
                 }
             };
-            tried_indices.push(acct_idx);
+            last_acct_idx = Some(acct_idx);
+
+            // If the picked account is on cooldown, sleep for it (capped per-iteration)
+            // and retry. We still count the attempt so we don't loop forever.
+            let cooldown_secs = {
+                let accounts = self.pool.accounts.read().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let acct = &accounts[acct_idx];
+                if acct.cooldown_until > now {
+                    (acct.cooldown_until - now) / 1000 + 1
+                } else {
+                    0
+                }
+            };
+            if cooldown_secs > 0 {
+                let remaining_budget = total_budget.saturating_sub(elapsed).as_secs();
+                let wait = cooldown_secs.min(60).min(remaining_budget);
+                if wait == 0 {
+                    warn!(
+                        "Cooldown {}s exceeds remaining budget for {}",
+                        cooldown_secs, path,
+                    );
+                    return Ok(Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .body(
+                            Full::new(Bytes::from("All accounts rate limited"))
+                                .map_err(|e| match e {})
+                                .boxed(),
+                        )
+                        .unwrap());
+                }
+                info!(
+                    "All accounts cooling down — waiting {}s (attempt {}, {}s left in budget)",
+                    wait, attempt, remaining_budget,
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                continue;
+            }
 
             let url = format!("https://{}{}", host, path);
-
             let mut req_builder = self.http_client.request(method.clone(), &url);
             req_builder = req_builder.headers(headers.clone());
             req_builder = req_builder.header("x-api-key", &access_token);
             req_builder = req_builder.header("authorization", format!("Bearer {}", access_token));
             req_builder = req_builder.header("Host", host);
-
             if !body_bytes.is_empty() {
                 req_builder = req_builder.body(body_bytes.clone());
             }
 
             let acct_name = {
                 let accounts = self.pool.accounts.read().await;
-                accounts.get(acct_idx).map(|a| a.name.clone()).unwrap_or_default()
+                accounts
+                    .get(acct_idx)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default()
             };
 
-            let resp = req_builder.send().await?;
+            let resp = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        "[{}] network error on {} (attempt {}): {} — retrying",
+                        acct_name, path, attempt, e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
             let status = resp.status();
             self.pool.record_request(acct_idx).await;
 
@@ -340,68 +422,103 @@ impl ProxyServer {
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(60);
 
-                self.pool.mark_rate_limited(acct_idx, retry_after).await;
+                // Distinguish server-side throttling ("not your usage limit") from
+                // per-account quota. Server-side throttle → short cooldown so we
+                // can keep retrying aggressively.
+                let body = resp.bytes().await.unwrap_or_default();
+                let body_str = std::str::from_utf8(&body).unwrap_or("");
+                let is_server_overload = body_str.contains("not your usage limit")
+                    || body_str.contains("overloaded_error");
+
+                let cooldown = if is_server_overload {
+                    retry_after.min(8)
+                } else {
+                    retry_after
+                };
+
+                self.pool.mark_rate_limited(acct_idx, cooldown).await;
                 warn!(
-                    "[{}] 429 on {} (attempt {}/{}) — trying next account",
+                    "[{}] 429 ({}) on {} (attempt {}, cooldown {}s, {}s elapsed)",
                     acct_name,
+                    if is_server_overload {
+                        "server-overload"
+                    } else {
+                        "quota"
+                    },
                     path,
-                    attempt + 1,
-                    max_retries
+                    attempt,
+                    cooldown,
+                    elapsed.as_secs(),
                 );
                 continue;
             }
 
-            // 401: try refreshing the token first before giving up.
-            // This handles server-side session rotation without unnecessarily
-            // putting the account on a long cooldown.
+            // 401: try refreshing the token in place. Pass our snapshot of
+            // the access_token so concurrent 401s on the same account don't
+            // race on the (one-time-use) refresh_token — the second caller
+            // will see the access_token has already been rotated and skip.
             if status == StatusCode::UNAUTHORIZED {
-                warn!(
-                    "[{}] 401 on {} — attempting token refresh",
-                    acct_name, path
-                );
-                if self.pool.refresh_token(acct_idx).await.is_ok() {
-                    info!("[{}] Token refreshed after 401, will retry on next attempt", acct_name);
-                    // Don't mark as rate limited — the refreshed token may work.
-                    // Let the retry loop pick this account again.
-                    continue;
+                warn!("[{}] 401 on {} — attempting token refresh", acct_name, path);
+                match self
+                    .pool
+                    .refresh_if_token_matches(acct_idx, &access_token)
+                    .await
+                {
+                    Ok(()) => {
+                        info!("[{}] Token refreshed after 401, retrying", acct_name);
+                        last_acct_idx = None;
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[{}] 401 on {} — refresh failed: {}, cooldown 24h",
+                            acct_name, path, e
+                        );
+                        self.pool.mark_rate_limited(acct_idx, 24 * 3600).await;
+                        continue;
+                    }
                 }
-                // Refresh failed — account is truly dead, long cooldown.
-                self.pool.mark_rate_limited(acct_idx, 3600).await;
+            }
+
+            // Transient upstream errors — retry on a different account.
+            if status == StatusCode::BAD_GATEWAY
+                || status == StatusCode::SERVICE_UNAVAILABLE
+                || status == StatusCode::GATEWAY_TIMEOUT
+                || status.as_u16() == 529
+            {
                 warn!(
-                    "[{}] 401 on {} — token refresh failed, cooldown 1h, trying next account",
-                    acct_name, path
+                    "[{}] {} on {} (attempt {}) — retrying",
+                    acct_name,
+                    status.as_u16(),
+                    path,
+                    attempt
                 );
+                self.pool.mark_rate_limited(acct_idx, 5).await;
                 continue;
             }
 
-            // Success — convert reqwest::Response to hyper::Response
-            info!("[{}] {} {} {}", acct_name, status.as_u16(), method, path);
+            // Success — stream response back to client.
+            info!(
+                "[{}] {} {} {} (attempt {}, {}s elapsed)",
+                acct_name,
+                status.as_u16(),
+                method,
+                path,
+                attempt,
+                elapsed.as_secs(),
+            );
 
             let mut builder = Response::builder().status(status);
-
-            // Copy response headers
             for (name, value) in resp.headers() {
                 builder = builder.header(name.as_str(), value.as_bytes());
             }
-
-            // Stream the response body
             let stream = resp.bytes_stream();
-            let body = StreamBody::new(
-                tokio_stream::StreamExt::map(stream, |chunk| {
-                    chunk
-                        .map(Frame::data)
-                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-                }),
-            );
-
+            let body = StreamBody::new(tokio_stream::StreamExt::map(stream, |chunk| {
+                chunk
+                    .map(Frame::data)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+            }));
             return Ok(builder.body(body.boxed()).unwrap());
         }
-
-        // All retries exhausted
-        warn!("All accounts rate limited for {}", path);
-        Ok(Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .body(Full::new(Bytes::from("All accounts rate limited")).map_err(|e| match e {}).boxed())
-            .unwrap())
     }
 }

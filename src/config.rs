@@ -86,6 +86,7 @@ impl Config {
         access_token: &str,
         refresh_token: &str,
         expires_at: u64,
+        scopes: &[String],
     ) -> Result<()> {
         let contents = std::fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&contents)?;
@@ -93,6 +94,9 @@ impl Config {
             acct.access_token = access_token.to_string();
             acct.refresh_token = refresh_token.to_string();
             acct.expires_at = expires_at;
+            if !scopes.is_empty() {
+                acct.scopes = scopes.to_vec();
+            }
         }
         let contents = serde_json::to_string_pretty(&config)?;
         std::fs::write(path, contents)?;
