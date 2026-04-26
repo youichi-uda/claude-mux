@@ -30,6 +30,7 @@ pub struct Account {
     pub expires_at: u64, // epoch ms
     pub scopes: Vec<String>,
     pub cooldown_until: u64, // epoch ms — 0 = not rate limited
+    pub last_refresh_at: u64, // epoch ms, 0 = never refreshed in this run
     pub request_count: u64,
     pub rate_limit_count: u64,
 }
@@ -43,6 +44,7 @@ impl Account {
             expires_at: cfg.expires_at,
             scopes: cfg.scopes.clone(),
             cooldown_until: 0,
+            last_refresh_at: 0,
             request_count: 0,
             rate_limit_count: 0,
         }
@@ -239,6 +241,30 @@ impl AccountPool {
             }
         }
 
+        // Frequency cap: if we already refreshed this account within the last
+        // 30s and a fresh 401 came in anyway, refreshing again will not help —
+        // the upstream is not minting working tokens, or the account is being
+        // throttled / has been invalidated. Bail out instead of hammering the
+        // OAuth endpoint, which itself rate-limits and can lock us out for
+        // hours if we keep retrying.
+        let (last_refresh, name) = {
+            let accounts = self.accounts.read().await;
+            (
+                accounts[index].last_refresh_at,
+                accounts[index].name.clone(),
+            )
+        };
+        let now = Account::now_ms();
+        if last_refresh > 0 && now.saturating_sub(last_refresh) < 30_000 {
+            anyhow::bail!(
+                "[{}] Refresh refused: last refresh was {}ms ago and the new \
+                 token still got 401 — the upstream is not minting working \
+                 tokens for this account",
+                name,
+                now - last_refresh
+            );
+        }
+
         let (refresh_token, name, scopes) = {
             let accounts = self.accounts.read().await;
             let a = &accounts[index];
@@ -300,6 +326,7 @@ impl AccountPool {
             acct.refresh_token = new_refresh.to_string();
             acct.expires_at = new_expires;
             acct.scopes = new_scopes.clone();
+            acct.last_refresh_at = Account::now_ms();
         }
 
         // Persist to config file

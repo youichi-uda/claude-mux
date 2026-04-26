@@ -385,7 +385,9 @@ impl ProxyServer {
             let url = format!("https://{}{}", host, path);
             let mut req_builder = self.http_client.request(method.clone(), &url);
             req_builder = req_builder.headers(headers.clone());
-            req_builder = req_builder.header("x-api-key", &access_token);
+            // Bearer only — OAuth tokens (sk-ant-oat01-…) sent via `x-api-key`
+            // get rejected with 401 (the API treats them as API keys instead
+            // of OAuth tokens). The official `claude` binary sends only Bearer.
             req_builder = req_builder.header("authorization", format!("Bearer {}", access_token));
             req_builder = req_builder.header("Host", host);
             if !body_bytes.is_empty() {
